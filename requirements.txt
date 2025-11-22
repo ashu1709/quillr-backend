@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+httpx
+authlib
+python-jose[cryptography]
+sqlmodel
+python-multipart
+python-dotenv
+psycopg2-binary
+alembic

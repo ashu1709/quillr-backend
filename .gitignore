@@ -1,0 +1,14 @@
+# Python Cache
+__pycache__/
+*.pyc
+
+# Env
+venv/
+.env
+
+# DB
+quillr.db
+
+# System
+.DS_Store
+.vscode/
