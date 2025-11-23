@@ -2,7 +2,7 @@ from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from app.db.session import get_session
-from app.db import models
+from app.db.models import User
 from app.utils.auth import create_jwt
 import os
 from urllib.parse import urlencode
@@ -35,7 +35,9 @@ def google_login():
         "prompt": "consent"
     }
 
-    google_auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    google_auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    )
 
     return RedirectResponse(google_auth_url)
 
@@ -58,43 +60,50 @@ def google_callback(request: Request, session: Session = Depends(get_session)):
         "client_secret": GOOGLE_CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": redirect_uri
+        "redirect_uri": redirect_uri,
     }
 
-    token_response = requests.post(token_url, data=token_data)
-    token_json = token_response.json()
-
-    access_token = token_json.get("access_token")
+    token_response = requests.post(token_url, data=token_data).json()
+    access_token = token_response.get("access_token")
 
     if not access_token:
         raise HTTPException(status_code=400, detail="Failed to get access token")
 
-    # Fetch Google user info
+    # Fetch Google profile
     user_info = requests.get(
         "https://www.googleapis.com/oauth2/v3/userinfo",
         headers={"Authorization": f"Bearer {access_token}"}
     ).json()
 
-    google_email = user_info.get("email")
-    google_name = user_info.get("name")
+    google_id = user_info.get("sub")
+    email = user_info.get("email")
+    name = user_info.get("name")
+    picture = user_info.get("picture")
 
-    if not google_email:
-        raise HTTPException(status_code=400, detail="Could not fetch Google user profile")
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account has no email")
 
-    # Check if user exists
-    user = session.query(models.User).filter(models.User.email == google_email).first()
+    # Find existing user
+    user = session.query(User).filter(
+        (User.email == email) | (User.google_id == google_id)
+    ).first()
 
+    # Create new user if needed
     if not user:
-        # Create user
-        user = models.User(name=google_name, email=google_email)
+        user = User(
+            email=email,
+            name=name,
+            google_id=google_id,
+            picture=picture
+        )
         session.add(user)
         session.commit()
         session.refresh(user)
 
-    # Generate JWT Token
+    # Generate JWT
     token = create_jwt({"user_id": user.id})
 
-    # Set cookie & redirect to frontend dashboard
+    # Set cookie and redirect
     response = RedirectResponse(f"{FRONTEND_URL}/dashboard")
     response.set_cookie(
         key="quillr_token",
@@ -102,14 +111,14 @@ def google_callback(request: Request, session: Session = Depends(get_session)):
         httponly=True,
         secure=True,
         samesite="none",
-        max_age=7 * 24 * 3600
+        max_age=7 * 24 * 3600,
     )
 
     return response
 
 
 # -------------------------------------------
-# Get logged in user info
+# WHO AM I
 # -------------------------------------------
 @router.get("/me")
 def get_me(request: Request, session: Session = Depends(get_session)):
@@ -117,7 +126,17 @@ def get_me(request: Request, session: Session = Depends(get_session)):
     if not token:
         return {"user": None}
 
-    data = create_jwt.verify(token)
-    user = session.query(models.User).filter(models.User.id == data["user_id"]).first()
+    payload = create_jwt.verify(token)
+    user = session.query(User).filter(User.id == payload["user_id"]).first()
 
-    return {"user": {"id": user.id, "name": user.name, "email": user.email}}
+    if not user:
+        return {"user": None}
+
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "picture": user.picture
+        }
+    }
