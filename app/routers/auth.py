@@ -1,27 +1,36 @@
+# app/routers/auth.py
+
 from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from app.db.session import get_session
 from app.db.models import User
-from app.utils.auth import create_jwt
+from app.utils.auth import create_jwt, verify_token
 import os
 from urllib.parse import urlencode
 import requests
 
 router = APIRouter()
 
+# ------------------------------
+# ENVIRONMENT VARIABLES
+# ------------------------------
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-BACKEND_URL = os.getenv("BACKEND_URL")
-FRONTEND_URL = os.getenv("FRONTEND_URL")
+BACKEND_URL = os.getenv("BACKEND_URL")  # e.g. https://quillr-backend.onrender.com
+FRONTEND_URL = os.getenv("FRONTEND_URL")  # e.g. https://quillr-frontend-zeta.vercel.app
 
+# Validate
 if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-    raise RuntimeError("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Render Env")
+    raise RuntimeError("Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in environment")
+
+if not BACKEND_URL or not FRONTEND_URL:
+    raise RuntimeError("Missing BACKEND_URL or FRONTEND_URL in environment")
 
 
-# -------------------------------------------
-# STEP 1 — Redirect to Google OAuth login
-# -------------------------------------------
+# ------------------------------------------------------
+# STEP 1 — Redirect user to Google OAuth login
+# ------------------------------------------------------
 @router.get("/google/login")
 def google_login():
     redirect_uri = f"{BACKEND_URL}/auth/google/callback"
@@ -42,19 +51,19 @@ def google_login():
     return RedirectResponse(google_auth_url)
 
 
-# -------------------------------------------
-# STEP 2 — Google redirects here with `code`
-# -------------------------------------------
+# ------------------------------------------------------
+# STEP 2 — Google redirects here with the ?code=
+# ------------------------------------------------------
 @router.get("/google/callback")
 def google_callback(request: Request, session: Session = Depends(get_session)):
+
     code = request.query_params.get("code")
-
     if not code:
-        raise HTTPException(status_code=400, detail="No authorization code provided")
+        raise HTTPException(status_code=400, detail="Authorization code missing")
 
-    token_url = "https://oauth2.googleapis.com/token"
     redirect_uri = f"{BACKEND_URL}/auth/google/callback"
 
+    # Exchange `code` for access token
     token_data = {
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
@@ -63,13 +72,18 @@ def google_callback(request: Request, session: Session = Depends(get_session)):
         "redirect_uri": redirect_uri,
     }
 
-    token_response = requests.post(token_url, data=token_data).json()
-    access_token = token_response.get("access_token")
+    token_res = requests.post("https://oauth2.googleapis.com/token", data=token_data)
+
+    if token_res.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to exchange code")
+
+    tokens = token_res.json()
+    access_token = tokens.get("access_token")
 
     if not access_token:
-        raise HTTPException(status_code=400, detail="Failed to get access token")
+        raise HTTPException(status_code=400, detail="Missing access token")
 
-    # Fetch Google profile
+    # Fetch Google User Info
     user_info = requests.get(
         "https://www.googleapis.com/oauth2/v3/userinfo",
         headers={"Authorization": f"Bearer {access_token}"}
@@ -80,20 +94,20 @@ def google_callback(request: Request, session: Session = Depends(get_session)):
     name = user_info.get("name")
     picture = user_info.get("picture")
 
-    if not email:
-        raise HTTPException(status_code=400, detail="Google account has no email")
+    if not google_id or not email:
+        raise HTTPException(status_code=400, detail="Invalid Google user info")
 
-    # Find existing user
+    # Check if user exists
     user = session.query(User).filter(
-        (User.email == email) | (User.google_id == google_id)
+        (User.google_id == google_id) | (User.email == email)
     ).first()
 
-    # Create new user if needed
+    # Create user if not found
     if not user:
         user = User(
+            google_id=google_id,
             email=email,
             name=name,
-            google_id=google_id,
             picture=picture
         )
         session.add(user)
@@ -103,8 +117,9 @@ def google_callback(request: Request, session: Session = Depends(get_session)):
     # Generate JWT
     token = create_jwt({"user_id": user.id})
 
-    # Set cookie and redirect
+    # Redirect to frontend with HTTP-only cookie
     response = RedirectResponse(f"{FRONTEND_URL}/dashboard")
+
     response.set_cookie(
         key="quillr_token",
         value=token,
@@ -117,17 +132,21 @@ def google_callback(request: Request, session: Session = Depends(get_session)):
     return response
 
 
-# -------------------------------------------
-# WHO AM I
-# -------------------------------------------
+# ------------------------------------------------------
+# WHO AM I (Frontend checks session)
+# ------------------------------------------------------
 @router.get("/me")
 def get_me(request: Request, session: Session = Depends(get_session)):
+
     token = request.cookies.get("quillr_token")
     if not token:
         return {"user": None}
 
-    payload = create_jwt.verify(token)
-    user = session.query(User).filter(User.id == payload["user_id"]).first()
+    payload = verify_token(token)
+    if not payload:
+        return {"user": None}
+
+    user = session.query(User).filter(User.id == payload.get("user_id")).first()
 
     if not user:
         return {"user": None}
@@ -137,6 +156,6 @@ def get_me(request: Request, session: Session = Depends(get_session)):
             "id": user.id,
             "email": user.email,
             "name": user.name,
-            "picture": user.picture
+            "picture": user.picture,
         }
     }
